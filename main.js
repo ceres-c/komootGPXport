@@ -1,25 +1,62 @@
 console.log("komootGPXport activated");
 
 const interval = setInterval(function () {
-    const downloadBtn = document.querySelector("[data-test-id=p_tour_save]");
-    if (!downloadBtn) return;
+    if (document.querySelector('#download-gpx'))
+        return;
 
-    clearInterval(interval);
-    downloadBtn.innerHTML = "Download GPX";
-    downloadBtn.addEventListener('click', (e) => {
-        e.stopPropagation();
-        e.preventDefault();
+    const saveBtn = document.querySelector("[data-test-id=p_tour_save]");
+    if (!saveBtn) {
+        console.error('No "Save route" button found');
+        return;
+    }
 
-        const coords = kmtBoot.getProps().page.linksEmbedded.tour.linksEmbedded.coordinates.attributes.items;
-
-        if (!coords) {
-            alert('There was an error reading the points of your route. If this keeps happening feel free to open an issue.');
-            return;
+    const downloadBtn = document.createElement("button");
+    downloadBtn.className = saveBtn.className;
+    downloadBtn.id = 'download-gpx';
+    downloadBtn.innerHTML = 'Download GPX';
+    downloadBtn.addEventListener('click', () => {
+        clearInterval(interval);
+        const ktmPage = kmtBoot.getProps().page;
+        if (ktmPage === undefined) {
+            alert('Cannot find page element in source. Is this your own tour?')
         }
+        const tour_link = ktmPage.links?.tour?.href
+        const coords = ktmPage.linksEmbedded?.tour?.linksEmbedded?.coordinates?.attributes?.items;
 
-        const gpx = jsonToGpx(coords);
-        downloadGpx(`route.gpx`, gpx);
-    })
+        if (coords !== undefined) {
+            // Got coordinates in the source, nice
+            let gpx = jsonToGpx(coords);
+            downloadGpx(`route.gpx`, gpx);
+        } else if (tour_link !== undefined) {
+            // Download JSON and fetch coords from there
+            fetch(tour_link)
+                .then(response => {
+                    if (!response.ok) throw new Error(`HTTP error ${response.status}`);
+                    return response.json();
+                })
+                .then(tour_data => {
+                    const coordinates_link = tour_data._links.coordinates.href;
+                    fetch(coordinates_link)
+                        .then(response => {
+                        if (!response.ok) throw new Error(`HTTP error ${response.status}`);
+                        return response.json();
+                    }).then(coordinates_data => {
+                        let gpx = jsonToGpx(coordinates_data.items);
+                        downloadGpx(`route.gpx`, gpx);
+                    })
+                    .catch(err => {
+                        console.error('Failed to load coordinates JSON:', err);
+                    });
+                })
+                .catch(err => {
+                    console.error('Failed to load tour JSON:', err);
+                });
+        } else {
+            alert('There was an error reading the points of your route. If this keeps happening feel free to open an issue.');
+            return;     
+        }
+    });
+    saveBtn.parentElement.appendChild(downloadBtn);
 }, 1000);
 
 const jsonToGpx = (coords) => {
