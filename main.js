@@ -1,51 +1,6 @@
 console.log("komootGPXport activated");
 
-const interval = setInterval(function () {
-    const downloadBtn = document.querySelector("[data-test-id=p_tour_save]");
-    if (!downloadBtn) return;
-
-    clearInterval(interval);
-    downloadBtn.innerHTML = "Download GPX";
-    downloadBtn.addEventListener('click', (e) => {
-        e.stopPropagation();
-        e.preventDefault();
-
-        const scripts = document.querySelectorAll('script');
-        let rawJsonString = null;
-
-        for (let script of scripts) {
-            const content = script.textContent || script.innerHTML;
-            if (content.includes('kmtBoot.setProps(')) {
-                // Extract the JSON string between the quotes
-                const match = content.match(/kmtBoot\.setProps\("(.+)"\)/);
-                if (match) {
-                    rawJsonString = match[1];
-                    break;
-                }
-            }
-        }
-
-        if (rawJsonString) {
-          console.log('rawJsonString: ', rawJsonString)
-            // Unescape the JSON string (it's likely escaped for JavaScript)
-            const unescapedJson = rawJsonString.replace(/\\"/g, '"').replace(/\\\\/g, '\\');
-            
-            // Parse the raw JSON
-            const rawData = JSON.parse(unescapedJson);
-            console.log('💽 Raw data:', rawData);
-            
-            // Now access coordinates the way they appear in the raw JSON
-            const coordinates = rawData.page._embedded.tour._embedded.coordinates.items;
-            console.log('🗺️ Coordinates:', coordinates);
-
-            const gpx = jsonToGpx(coordinates);
-            downloadGpx(`route.gpx`, gpx);
-        } else {
-            alert('There was an error reading the points of your route. If this keeps happening feel free to open an issue.');
-            return;
-        }
-    })
-}, 1000);
+// === Utility functions ===
 
 const jsonToGpx = (coords) => {
     let gpx =
@@ -75,3 +30,281 @@ const downloadGpx = (filename, text) => {
 
     document.body.removeChild(elem);
 }
+
+// === Name helpers ===
+
+function sanitizeFilename(name) {
+    return name.replace(/[<>:"/\\|?*]+/g, '').replace(/\s+/g, ' ').trim();
+}
+
+function getParsedPageData() {
+    // Parse kmtBoot.setProps() once and cache
+    if (getParsedPageData._cache) return getParsedPageData._cache;
+    const scripts = document.querySelectorAll('script');
+    for (let script of scripts) {
+        const content = script.textContent || script.innerHTML;
+        if (content.includes('kmtBoot.setProps(')) {
+            const match = content.match(/kmtBoot\.setProps\("(.+)"\)/);
+            if (match) {
+                try {
+                    const unescapedJson = match[1].replace(/\\"/g, '"').replace(/\\\\/g, '\\');
+                    getParsedPageData._cache = JSON.parse(unescapedJson);
+                    return getParsedPageData._cache;
+                } catch (e) {}
+            }
+        }
+    }
+    return null;
+}
+
+function getTourName() {
+    const data = getParsedPageData();
+    return data?.page?._embedded?.tour?.name || 'route';
+}
+
+function getCollectionName() {
+    const data = getParsedPageData();
+    return data?.page?._embedded?.collectionHal?.name?.trim() || 'collection';
+}
+
+function getCollectionLegName(tourId) {
+    const data = getParsedPageData();
+    const items = data?.page?._embedded?.collectionHal?._embedded?.compilation?._embedded?.items;
+    if (!items) return null;
+    const leg = items.find(i => String(i.id) === String(tourId));
+    return leg?.name || null;
+}
+
+// === Coordinate fetching (upstream method first, then fallback) ===
+
+function getCoordsFromScriptTags() {
+    // Upstream method: parse kmtBoot.setProps() from <script> tags
+    const rawData = getParsedPageData();
+    if (!rawData) return null;
+    const coordinates = rawData.page?._embedded?.tour?._embedded?.coordinates?.items;
+    return (coordinates && coordinates.length > 0) ? coordinates : null;
+}
+
+function getCoordsFromGetProps() {
+    // Fallback: use kmtBoot.getProps() API
+    try {
+        const page = kmtBoot.getProps().page;
+        if (!page) return { coords: null, tourLink: null };
+        const coords = page.linksEmbedded?.tour?.linksEmbedded?.coordinates?.attributes?.items;
+        const tourLink = page.links?.tour?.href;
+        return { coords: coords && coords.length > 0 ? coords : null, tourLink };
+    } catch (e) {
+        console.error('komootGPXport: kmtBoot.getProps() failed:', e);
+        return { coords: null, tourLink: null };
+    }
+}
+
+function fetchCoordsFromTourLink(tourLink) {
+    // Last resort: fetch coordinates via API links
+    return fetch(tourLink)
+        .then(response => {
+            if (!response.ok) throw new Error(`HTTP error ${response.status}`);
+            return response.json();
+        })
+        .then(tour_data => {
+            const coordinates_link = tour_data._links.coordinates.href;
+            return fetch(coordinates_link);
+        })
+        .then(response => {
+            if (!response.ok) throw new Error(`HTTP error ${response.status}`);
+            return response.json();
+        })
+        .then(coordinates_data => coordinates_data.items);
+}
+
+function downloader() {
+    const filename = sanitizeFilename(getTourName()) + '.gpx';
+
+    // Method 1: Parse <script> tags (upstream approach)
+    const scriptCoords = getCoordsFromScriptTags();
+    if (scriptCoords) {
+        const gpx = jsonToGpx(scriptCoords);
+        downloadGpx(filename, gpx);
+        return;
+    }
+
+    // Method 2: kmtBoot.getProps() fallback
+    const { coords, tourLink } = getCoordsFromGetProps();
+    if (coords) {
+        const gpx = jsonToGpx(coords);
+        downloadGpx(filename, gpx);
+        return;
+    }
+
+    // Method 3: Fetch from tour API link
+    if (tourLink) {
+        fetchCoordsFromTourLink(tourLink)
+            .then(items => {
+                const gpx = jsonToGpx(items);
+                downloadGpx(filename, gpx);
+            })
+            .catch(err => {
+                console.error('komootGPXport: Failed to fetch coordinates:', err);
+                alert('There was an error reading the points of your route. If this keeps happening feel free to open an issue.');
+            });
+        return;
+    }
+
+    alert('There was an error reading the points of your route. If this keeps happening feel free to open an issue.');
+}
+
+// === Planner page: add button next to "Save route" ===
+
+function waitForElm(selector) {
+    return new Promise(resolve => {
+        if (document.querySelector(selector)) {
+            return resolve(document.querySelector(selector));
+        }
+
+        const observer = new MutationObserver(() => {
+            if (document.querySelector(selector)) {
+                observer.disconnect();
+                resolve(document.querySelector(selector));
+            }
+        });
+        observer.observe(document.body, {
+            childList: true,
+            subtree: true
+        });
+    });
+}
+
+function addPlannerButton() {
+    waitForElm("[data-test-id=p_tour_save]").then((saveBtn) => {
+        if (document.querySelector("#download-gpx"))
+            return;
+        const downloadBtn = saveBtn.cloneNode(true);
+        downloadBtn.id = 'download-gpx';
+        downloadBtn.removeAttribute('data-test-id');
+        downloadBtn.removeAttribute('href');
+        downloadBtn.style.cursor = 'pointer';
+        // Replace icon with download icon
+        const svg = downloadBtn.querySelector('svg');
+        if (svg) {
+            svg.innerHTML = '<path d="M10 2.5v10m0 0L6.25 8.75M10 12.5l3.75-3.75M3.33 14.17v.83a2.5 2.5 0 002.5 2.5h8.34a2.5 2.5 0 002.5-2.5v-.83" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" fill="none"/>';
+        }
+        // Replace text
+        const textEl = downloadBtn.querySelector('p');
+        if (textEl) textEl.textContent = 'Download GPX (free)';
+        downloadBtn.addEventListener('click', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            downloader();
+        });
+        // Match spacing with the cross button on the right
+        saveBtn.parentElement.style.gap = '8px';
+        saveBtn.parentElement.insertBefore(downloadBtn, saveBtn);
+    });
+}
+
+// === Tour/collection page: add button after "Send to Phone" ===
+
+function makeDownloadButton(templateBtn, id, clickHandler) {
+    const downloadBtn = templateBtn.cloneNode(true);
+    downloadBtn.id = id;
+    downloadBtn.removeAttribute('href');
+    downloadBtn.setAttribute('role', 'button');
+    downloadBtn.style.cursor = 'pointer';
+    const textEl = downloadBtn.querySelector('p');
+    if (textEl) textEl.textContent = 'Download GPX (free)';
+    const svg = downloadBtn.querySelector('svg');
+    if (svg) {
+        svg.innerHTML = '<path d="M10 2v11m0 0l-3.5-3.5M10 13l3.5-3.5M3 15v1a2 2 0 002 2h10a2 2 0 002-2v-1" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" fill="none"/>';
+    }
+    downloadBtn.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        clickHandler();
+    });
+    return downloadBtn;
+}
+
+function getTourIdFromContext(sendToPhoneLink) {
+    // Walk up to find a nearby tour link and extract the tour ID
+    let el = sendToPhoneLink.parentElement;
+    for (let i = 0; i < 5; i++) {
+        if (!el) break;
+        el = el.parentElement;
+        const tourLink = el.querySelector('a[href*="/tour/"]');
+        if (tourLink) {
+            const match = tourLink.href.match(/\/tour\/(\d+)/);
+            if (match) return match[1];
+        }
+    }
+    return null;
+}
+
+function downloadByTourId(tourId) {
+    const colName = sanitizeFilename(getCollectionName());
+    const legName = getCollectionLegName(tourId);
+    const filename = legName
+        ? sanitizeFilename(colName + ' - ' + legName) + '.gpx'
+        : colName + '.gpx';
+
+    const coordsUrl = `https://api.komoot.de/v007/tours/${tourId}/coordinates`;
+    fetch(coordsUrl)
+        .then(response => {
+            if (!response.ok) throw new Error(`HTTP error ${response.status}`);
+            return response.json();
+        })
+        .then(data => {
+            if (!data.items || data.items.length === 0) throw new Error('No coordinates found');
+            const gpx = jsonToGpx(data.items);
+            downloadGpx(filename, gpx);
+        })
+        .catch(err => {
+            console.error('komootGPXport: Failed to fetch coordinates:', err);
+            alert('There was an error reading the points of your route. If this keeps happening feel free to open an issue.');
+        });
+}
+
+function addTourButtons() {
+    const isTourPage = /\/(tour|smarttour)\//.test(window.location.pathname);
+    const isCollectionPage = /\/collection\//.test(window.location.pathname);
+    if (!isTourPage && !isCollectionPage) return;
+
+    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+    let idx = 0;
+    while (walker.nextNode()) {
+        if (walker.currentNode.textContent.trim() !== 'Send to Phone') continue;
+        const sendToPhoneLink = walker.currentNode.parentElement?.parentElement;
+        if (!sendToPhoneLink || sendToPhoneLink.tagName !== 'A') continue;
+        const container = sendToPhoneLink.parentElement;
+        if (!container) continue;
+
+        const btnId = idx === 0 ? 'download-gpx-tour' : `download-gpx-tour-${idx}`;
+        if (document.querySelector(`#${btnId}`)) { idx++; continue; }
+
+        if (isTourPage && idx === 0) {
+            // Single tour page: use the full downloader with all fallbacks
+            container.appendChild(makeDownloadButton(sendToPhoneLink, btnId, downloader));
+        } else if (isCollectionPage) {
+            // Collection page: fetch coordinates by tour ID from nearby link
+            const tourId = getTourIdFromContext(sendToPhoneLink);
+            if (tourId) {
+                container.appendChild(makeDownloadButton(sendToPhoneLink, btnId, () => downloadByTourId(tourId)));
+            }
+        }
+        idx++;
+    }
+}
+
+// === Init: observe DOM and add buttons as appropriate ===
+
+const observer = new MutationObserver(() => {
+    addPlannerButton();
+    addTourButtons();
+});
+observer.observe(document.body, {
+    childList: true,
+    subtree: true
+});
+
+// Also run once immediately
+addPlannerButton();
+addTourButtons();
