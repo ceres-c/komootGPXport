@@ -38,8 +38,12 @@ function sanitizeFilename(name) {
 }
 
 function getParsedPageData() {
-    // Parse kmtBoot.setProps() once and cache
-    if (getParsedPageData._cache) return getParsedPageData._cache;
+    // Cache is keyed by URL so SPA navigations always get fresh data
+    if (getParsedPageData._cache && getParsedPageData._url === location.href) {
+        return getParsedPageData._cache;
+    }
+    getParsedPageData._cache = null;
+    getParsedPageData._url = location.href;
     const scripts = document.querySelectorAll('script');
     for (let script of scripts) {
         const content = script.textContent || script.innerHTML;
